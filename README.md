@@ -99,6 +99,12 @@ The maintained [verification skill](.agents/skills/verify-rillmap/SKILL.md) desc
 
 The driver records actions and assertions in `.runs/<timestamp>/evidence.json`, logs each owned process, retains all durable artifacts, and confirms evidence survives cleanup. This is an executable correctness/recovery check, not a throughput or scale benchmark.
 
+## Reproducible benchmark
+
+The [frozen benchmark driver](.agents/skills/verify-rillmap/features/benchmark.md) measures real HTTP jobs with separate worker processes and exact independent durable-result checks. Run `node --test tools/benchmark.test.mjs` and `node tools/benchmark.mjs smoke` for a short correctness check. Run `node tools/benchmark.mjs benchmark` on an isolated Linux runner for five-repeat worker/data/skew comparisons, offered-load sweeps, a stability run and observed worker loss. `node tools/benchmark.mjs profile` is a separate diagnostic campaign. The manual `Benchmark` workflow retains raw receipts under `.runs/benchmark-*/` with source, machine, input hashes, outcomes, scheduled-arrival latency, shuffle bytes and CPU/RSS samples. Read the feature page for frozen cells and limitations.
+
+No measured performance result is published yet. The existing verification journeys establish correctness and recovery only. Benchmark results require retained hosted receipts, median/range and a separate profile explaining the limiter.
+
 ## Sources and scope
 
 - [Brown CS1380/1385/2380 milestones (2026)](https://cs.brown.edu/courses/csci1380/milestones/) and [M5: Distributed Processing](https://docs.google.com/document/d/e/2PACX-1vSE-N3JJT-zJ9SUTuWJkxvNlEmRgCKNG004SZxwnxWRTTUCTq353FKV4XdTygiDTwvtS8Vd8w6_ucfQ/pub) supply the coursework context: map/reduce abstractions, phase coordination, shuffling and the example scenarios. This project substitutes named trusted modules and JSON pairs for serialized function objects and the course's distributed key-value API; it does not implement every optional extension or claim course grader compatibility.

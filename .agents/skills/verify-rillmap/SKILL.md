@@ -15,5 +15,7 @@ The driver submits `POST /jobs`, polls `GET /jobs/:id`, and compares actual resu
 # Evidence
 `.runs/<timestamp>/evidence.json` records actions, job states, assertions and artifact manifests. `.runs` is ignored. Read the durable coordinator state, accepted attempt files and worker-local files alongside API responses. Require oracle equality and one accepted publication per task. See `features/README.md`.
 
+For frozen load measurement use [the benchmark feature](features/benchmark.md). The reusable command is `node tools/benchmark.mjs smoke`; measurement and separate profiling use `benchmark` and `profile` on isolated Linux runners. Never treat a correctness smoke as throughput evidence.
+
 # Cleanup
 The driver kills and waits for only its tracked child handles in `finally`. All data, logs and evidence survive cleanup. A nonzero exit is failure, even if some evidence was written. Confirm `evidence.json` exists after process cleanup. Failed runs retain failure details.

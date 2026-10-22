@@ -1,0 +1,33 @@
+name: Benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Measurement or separate CPU profile
+        type: choice
+        options: [benchmark, profile]
+        default: benchmark
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      NODE_OPTIONS: --max-old-space-size=768
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 25.8.1
+      - run: npm run check
+      - run: node --test tools/benchmark.test.mjs
+      - run: node tools/benchmark.mjs smoke
+      - run: node tools/benchmark.mjs ${{ inputs.mode }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-${{ inputs.mode }}-${{ github.sha }}
+          path: .runs/benchmark-*/
+          include-hidden-files: true
+          retention-days: 14
