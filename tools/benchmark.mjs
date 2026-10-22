@@ -183,7 +183,8 @@ async function main() {
     return result;
   };
   try {
-    if (mode !== 'benchmark') await run({records: mode === 'smoke' ? 16 : 2048, skew: .9, workers: 2, jobs: mode === 'smoke' ? 1 : workload.jobs});
+    if (mode === 'smoke') await run({records: 16, skew: .9, workers: 2, jobs: 1});
+    else if (mode === 'profile') await run({records: 256, skew: .9, workers: 4, rate: 8, seconds: workload.stabilitySeconds, stability: true});
     else {
       for (let repeat = 0; repeat < workload.repeats; repeat++) for (const records of workload.records) for (const skew of workload.skews) {
         const order = repeat % 2 ? [...workload.workers].reverse() : workload.workers;
