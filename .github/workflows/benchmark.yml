@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: 25.8.1
       - run: npm run check
-      - run: node --test tools/benchmark.test.mjs
+      - run: node --test tools/benchmark.test.mjs tools/metadata.test.mjs
       - run: node tools/benchmark.mjs smoke
       - run: node tools/benchmark.mjs ${{ inputs.mode }}
       - uses: actions/upload-artifact@v4

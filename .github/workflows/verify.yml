@@ -15,6 +15,7 @@ jobs:
         with:
           node-version: 25
       - run: npm run check
+      - run: node --test tools/benchmark.test.mjs tools/metadata.test.mjs
       - run: npm test
       - uses: actions/upload-artifact@v4
         if: always()

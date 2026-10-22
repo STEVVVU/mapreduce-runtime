@@ -5,6 +5,7 @@ import net from 'node:net';
 import {createHash, randomUUID} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {atomic, body, config, ensure, pairs, read, bucket} from './common.mjs';
+import {metadataFile, readMetadata} from './metadata.mjs';
 
 const options = config(), root = path.resolve(options.data ?? 'data/coordinator');
 const port = Number(options.port ?? 8080), leaseMs = Number(options.lease ?? 10000);
@@ -31,15 +32,16 @@ if (fs.existsSync(lock)) {
   fs.unlinkSync(lock);
 }
 fs.writeFileSync(lock, JSON.stringify({pid: process.pid}), {flag: 'wx'});
-const stateFile = path.join(root, 'state.json');
-const state = fs.existsSync(stateFile) ? read(stateFile) : {jobs: {}};
+const state = readMetadata(root);
 function persist(file, value) {
   try { atomic(file, value); }
   catch (error) { console.error('Persistence failed; refusing further requests', error); process.exit(1); }
 }
-const save = () => persist(stateFile, state);
-for (const job of Object.values(state.jobs)) for (const task of job.tasks) if (task.status === 'running') task.status = 'pending';
-save();
+const save = job => persist(metadataFile(root, job.id), job);
+for (const job of Object.values(state.jobs)) {
+  for (const task of job.tasks) if (task.status === 'running') task.status = 'pending';
+  save(job);
+}
 const artifact = task => path.join(root, 'attempts', `${task.accepted}.json`);
 const taskList = count => Array.from({length: count}, (_, index) => ({index, status: 'pending', attempts: 0}));
 function advance(job) {
@@ -58,10 +60,10 @@ function claim(worker) {
     for (const task of job.tasks) {
       if (task.status === 'running' && task.until <= Date.now()) { task.status = 'pending'; job.events.push({type: 'expired', token: task.token}); }
       if (task.status !== 'pending') continue;
-      if (task.attempts >= 4) { job.status = 'failed'; job.error = 'task exceeded four attempts'; save(); break; }
+      if (task.attempts >= 4) { job.status = 'failed'; job.error = 'task exceeded four attempts'; save(job); break; }
       Object.assign(task, {status: 'running', worker, token: randomUUID(), until: Date.now() + leaseMs, attempts: task.attempts + 1});
       job.events.push({type: 'assigned', phase: job.status, index: task.index, worker, token: task.token});
-      save();
+      save(job);
       return {job: job.id, module: job.module, phase: job.status, index: task.index, token: task.token, reducers: job.reducers, maps: job.maps?.length ?? 0, leaseMs};
     }
   }
@@ -85,7 +87,7 @@ const server = http.createServer(async (req, res) => {
       input.keys.forEach((pair, i) => chunks[i % splits].push(pair));
       chunks.forEach((chunk, i) => persist(path.join(root, 'inputs', id, `${i}.json`), chunk));
       state.jobs[id] = {id, module: input.module, reducers, status: 'map', tasks: taskList(splits), events: [{type: 'submitted'}]};
-      save(); result = {id};
+      save(state.jobs[id]); result = {id};
     } else if (req.method === 'POST' && parts.join('/') === 'claim') {
       const request = await body(req);
       ensure(request && typeof request === 'object', 'expected claim object');
@@ -115,7 +117,7 @@ const server = http.createServer(async (req, res) => {
           ensure(job.status === completion.phase && task.status === 'running' && task.token === completion.token && task.until > Date.now(), 'stale attempt', 409);
           if (completion.error) {
             ensure(typeof completion.error === 'string' && completion.error.length <= 2000, 'invalid error');
-            task.status = 'pending'; job.events.push({type: 'error', token: task.token, error: completion.error}); save(); result = {retry: true};
+            task.status = 'pending'; job.events.push({type: 'error', token: task.token, error: completion.error}); save(job); result = {retry: true};
           } else {
             if (completion.phase === 'map') {
               ensure(Array.isArray(completion.output) && completion.output.length === job.reducers, 'invalid partition count');
@@ -127,7 +129,7 @@ const server = http.createServer(async (req, res) => {
             }
             persist(path.join(root, 'attempts', `${task.token}.json`), completion.output);
             task.status = 'done'; task.accepted = task.token;
-            job.events.push({type: 'published', token: task.token}); advance(job); save(); result = {accepted: true};
+            job.events.push({type: 'published', token: task.token}); advance(job); save(job); result = {accepted: true};
           }
         }
       } else ensure(false, 'not found', 404);

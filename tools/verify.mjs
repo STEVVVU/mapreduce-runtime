@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {atomic, encode, read, rpc, sleep} from '../src/common.mjs';
+import {readMetadata} from '../src/metadata.mjs';
 
 const run = path.resolve('.runs', new Date().toISOString().replaceAll(':', '-'));
 fs.mkdirSync(run, {recursive: true});
@@ -58,7 +59,18 @@ async function compare(module, keys, expected) {
 try {
   assert.throws(() => encode({nested: [Infinity]}), /nonfinite/);
   assert.throws(() => encode({nested: [NaN]}), /nonfinite/);
+  const legacyId = randomUUID(), legacyToken = randomUUID();
+  const corruptRoot = path.join(run, 'corrupt-coordinator');
+  atomic(path.join(corruptRoot, 'jobs', `${randomUUID()}.json`), {id: randomUUID()});
+  const corrupt = launch('src/coordinator.mjs', ['--data', corruptRoot, '--port', '0'], 'corrupt-coordinator');
+  assert.notEqual(await new Promise(resolve => corrupt.once('exit', resolve)), 0, 'corrupt accepted metadata must fail startup');
+  evidence.checks.push({case: 'corrupt durable metadata refuses startup', pid: corrupt.pid});
+  const legacyJob = {id: legacyId, module: 'wordcount', reducers: 1, status: 'map', tasks: [{index: 0, status: 'running', attempts: 1, worker: 'legacy-worker', token: legacyToken, until: Date.now() + 60000}], events: [{type: 'submitted'}]};
+  atomic(path.join(run, 'coordinator', 'inputs', legacyId, '0.json'), [['legacy', 'legacy legacy']]);
+  atomic(path.join(run, 'coordinator', 'state.json'), {jobs: {[legacyId]: legacyJob}});
   await startCoordinator();
+  assert.equal((await call(`/jobs/${legacyId}`)).tasks[0].status, 'pending');
+  await assert.rejects(call(`/jobs/${legacyId}/complete`, 'POST', {phase: 'map', index: 0, token: legacyToken, output: []}), e => e.status === 409);
   await assert.rejects(rpc(`${url}/health`, 'incorrect'), e => e.status === 401);
   await assert.rejects(call('/jobs', 'POST', {module: '../bad', keys: []}), e => e.status === 400);
   await assert.rejects(call('/jobs', 'POST', {module: 'wordcount', keys: [[7, 'bad']]}), e => e.status === 400);
@@ -70,6 +82,9 @@ try {
   const competitor = launch('src/coordinator.mjs', ['--data', path.join(run, 'coordinator'), '--port', '0'], 'competing-coordinator');
   const competingExit = await new Promise(resolve => competitor.once('exit', resolve)); assert.notEqual(competingExit, 0);
   const peers = [worker('worker-0'), worker('worker-1'), worker('worker-2')];
+  assert.deepEqual((await done(legacyId)).output, [['legacy', 2]]);
+  assert.equal(read(path.join(run, 'coordinator', 'state.json')).jobs[legacyId].tasks[0].token, legacyToken, 'legacy source remains preserved');
+  evidence.checks.push({case: 'legacy running-state import and stale lease fencing', id: legacyId});
   const keys = [['doc-a', 'Alpha beta alpha'], ['doc-a', 'beta gamma'], ['doc-b', 'ALPHA '.repeat(1000)], ['empty', '']];
   const base = await compare('wordcount', keys, countOracle(keys));
   const readings = [['duplicate', {station: 'north', temperature: -8}], ['duplicate', {station: 'north', temperature: -2}], ['x', {station: 'south', temperature: 30}], ['y', {station: 'south', temperature: 19}]];
@@ -119,6 +134,7 @@ try {
   for (const child of contenders) await stop(child);
   await startCoordinator();
   await assert.rejects(call(`/jobs/${restartId}/complete`, 'POST', {phase: 'map', index: old.index, token: old.token, output: []}), e => e.status === 409);
+  assert.deepEqual((await call(`/jobs/${legacyId}`)).output, [['legacy', 2]], 'authoritative metadata must override stale legacy lease after restart');
   const restartPeer = worker('restart-peer');
   const restarted = await done(restartId); assert.deepEqual(restarted.output, countOracle(crashKeys));
   assert(restarted.maps.some(t => t.attempts >= 2));
@@ -130,7 +146,7 @@ try {
   assert.deepEqual(duplicate, {accepted: true, duplicate: true});
   const acceptedReduce = base.tasks[0];
   assert.deepEqual(await call(`/jobs/${base.id}/complete`, 'POST', {phase: 'reduce', index: acceptedReduce.index, token: acceptedReduce.accepted}), duplicate);
-  const snapshot = read(path.join(run, 'coordinator', 'state.json'));
+  const snapshot = readMetadata(path.join(run, 'coordinator'));
   for (const job of Object.values(snapshot.jobs)) {
     if (job.status === 'failed') continue;
     const publications = job.events.filter(e => e.type === 'published').map(e => e.token);
