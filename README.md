@@ -1,5 +1,12 @@
 # MapReduce runtime
 
+## Guide
+
+- [Architecture and execution guide](#architecture-and-execution-guide)
+- [Verification and evidence](#verification-and-evidence)
+- [Reproducible benchmark](#reproducible-benchmark)
+- [Sources and scope](#sources-and-scope)
+
 A small, dependency-free MapReduce engine using separate Node worker processes and loopback HTTP. It partitions input records, maps on workers, hashes intermediate keys into reducer partitions, transfers partitions over HTTP, groups and sorts keys, and reduces on workers. Inputs, worker files, accepted attempts and final output survive process cleanup.
 
 This is an original educational implementation informed by Brown's distributed processing milestone and the MapReduce paper. No finished student solution was copied, and this is not a drop-in implementation of Brown's distribution library. The public project name is **MapReduce runtime**; the original local checkout directory may be named `rillmap`.
@@ -115,3 +122,126 @@ The [initial hosted measurements](docs/benchmarks/2026-10-22-initial.md) retain 
 Original source is MIT licensed. Sources are attributed as conceptual references; no source code from the course stencil or student repositories is included.
 
 The ownership mechanism uses the standard Node [IPC API](https://nodejs.org/download/release/v24.21.0/docs/api/net.html#ipc-support). Linux abstract sockets and Windows named pipes avoid stale filesystem socket deletion races.
+
+## Architecture and execution guide
+
+Rillmap is a small Node MapReduce runtime. It implements one coordinator, separate worker processes, named trusted map/reduce modules, durable task files, and recovery metadata. It is a single-host teaching runtime, not a cloud service or distributed database.
+
+A submitted job is split into [map tasks](#map-task). The coordinator waits at the [map barrier](#map-barrier), then schedules [reduce tasks](#reduce-task) over the key-hashed [shuffle](#shuffle) partitions. Leases bound task ownership; [durable publication](#durable-publication) follows accepted outputs.
+
+```mermaid
+flowchart LR
+  Client["Job client"] --> Coordinator["Coordinator HTTP API"]
+  Coordinator <--> Workers["Separate worker processes"]
+  Workers --> Modules["Allowlisted map and reduce modules"]
+  Workers --> Files["Task input, shuffle, output files"]
+  Coordinator --> Registry["Durable coordinator metadata"]
+  Client --> Result["Published job result"]
+  Coordinator --> Result
+```
+
+The worker executes configured modules and stores artifacts. Coordinator state tracks assignments, leases, and accepted outputs; the result appears after the reduce barrier.
+
+```mermaid
+flowchart TD
+  subgraph Coordinator["Coordinator state machine"]
+    Submit["Validate job and module pair"] --> Maps["Assign map partitions"]
+    Maps --> MapDone{"All maps accepted?"}
+    MapDone -->|"No"| Maps
+    MapDone -->|"Yes"| Reduce["Assign reducer partitions"]
+    Reduce --> ReduceDone{"All reducers accepted?"}
+    ReduceDone -->|"No"| Reduce
+    ReduceDone -->|"Yes"| Commit["Persist completed job result"]
+    Lease["Lease expires or worker dies"] --> RetryMap["Retry map attempt"]
+    Lease --> RetryReduce["Retry reduce attempt"]
+    RetryMap --> Maps
+    RetryReduce --> Reduce
+  end
+  subgraph Worker["Worker process"]
+    Poll["Poll coordinator"] --> Execute["Run trusted task"]
+    Execute --> Store["Write task files"]
+    Store --> Complete["Report task and attempt"]
+  end
+  Maps --> Poll
+  Reduce --> Poll
+  Complete --> MapDone
+  Complete --> ReduceDone
+```
+
+| Subsystem | Responsibility and owned state | Source |
+|---|---|---|
+| Coordinator | Job validation, phase barrier, worker assignment, attempt fencing, publication | [`coordinator.mjs`](src/coordinator.mjs) |
+| Worker | Polls assignments and executes partitions in separate process | [`worker.mjs`](src/worker.mjs) |
+| Job modules | Supply trusted transforms, such as word count and temperature maximum | [`wordcount.mjs`](jobs/wordcount.mjs), [`max-temperature.mjs`](jobs/max-temperature.mjs) |
+| Metadata and file helpers | Persist coordinator metadata and validate job values | [`metadata.mjs`](src/metadata.mjs), [`common.mjs`](src/common.mjs) |
+| Verification | Starts real processes and checks saved outputs and recovery | [`verify.mjs`](tools/verify.mjs) |
+
+### Job journey
+
+1. Submit named module functions and JSON records. The coordinator validates the request and records map tasks.
+2. Workers receive partitions, run map functions, and write intermediate files.
+3. After all accepted maps, the coordinator groups pairs by key into reducer partitions and schedules reduce work.
+4. Reducers persist outputs. The coordinator validates task attempt and durable result, then publishes the whole job result.
+5. Worker death or lease expiry triggers a bounded retry. Invalid data or exhausted attempts produce a failed job rather than partial success.
+
+### Design decisions and tradeoffs
+
+Rationales are inferred from current code.
+
+| Choice | Practical reason | Alternative and cost to reconsider |
+|---|---|---|
+| Name and allowlist modules | Workers run known installed code without serialized functions | Upload function bodies, adding code distribution and trust concerns |
+| Separate map and reduce phases | Reducers read complete intermediate partitions | Stream reducers early, complicating retries and ordering |
+| Persist task artifacts | Restart and verification can inspect worker files | Keep data in memory and lose it on process exit |
+| Track accepted attempt | A stale completion cannot replace current output | Accept by task ID alone and risk late publication |
+| Keep one coordinator | Small runtime with direct persistence boundary | Replicate metadata and require consensus/failover machinery |
+
+### Glossary
+
+<a id="map-task"></a>
+
+<details><summary>What is a map task?</summary>
+
+It applies the map function to an input partition and emits pairs. Word count emits `1` for each normalized word.
+
+</details>
+
+<a id="reduce-task"></a>
+
+<details><summary>What is a reduce task?</summary>
+
+It combines values for a key after mapping. Word count sums emitted ones for each word.
+
+</details>
+
+<a id="shuffle"></a>
+
+<details><summary>What is the shuffle?</summary>
+
+It groups intermediate pairs by key into reducer partitions. Here files persist those pairs for reducer reads.
+
+</details>
+
+<a id="map-barrier"></a>
+
+<details><summary>What is the map barrier?</summary>
+
+It requires every map task to be accepted before reduction begins, so a late map cannot be omitted from a result.
+
+</details>
+
+<a id="lease"></a>
+
+<details><summary>What is a task lease?</summary>
+
+A lease gives a worker a bounded interval for a task. Expiry allows retry and fences the earlier attempt.
+
+</details>
+
+<a id="durable-publication"></a>
+
+<details><summary>What is durable publication?</summary>
+
+It records task output before exposing the completed job. Verification compares API output with saved result files.
+
+</details>
