@@ -2,6 +2,260 @@
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Submit a word-count job over a small list of text records using the installed word-count module and two reducers.
+
+**Trace.** [Authenticate and bound RPC](#flow-step-http-boundary) → [Validate job and write round-robin splits](#flow-step-submit-split) → [Fetch input and map to hash buckets](#flow-step-worker-map) → [Save local task output and report completion](#flow-step-write-output) → [Fence attempt and accept one receipt](#flow-step-accept-completion) → [Persist artifact before metadata and advance barriers](#flow-step-publish-advance) → [Fetch shuffle, group and reduce](#flow-step-worker-reduce) → [Persist artifact before metadata and advance barriers](#flow-step-publish-advance).
+
+**Result and boundary.** Map attempts write partitioned artifacts before accepted completion advances the map barrier. Reduce tasks then group and reduce those accepted partitions; the same fenced publication path advances the final barrier and publishes the job result. Stale attempt tokens cannot commit.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why publish an attempt artifact before marking its task complete?** Persisting output before state advancement avoids advertising completion without durable output, and fencing rejects stale worker attempts. The tradeoff is that retries and duplicate receipts need explicit handling.
+
+[Atomic file publication ordering](#technique-atomic-file-publication-ordering) · [Attempt fencing and accepted receipts](#technique-attempt-fencing-idempotent-receipts).
+
+</details>
+
+#### Primary execution flow
+
+POST /jobs creates durable round-robin map inputs. Workers claim leased tasks, map or reduce through HTTP and report token-fenced output; accepted artifacts and metadata lead through barriers to the durable result.
+
+```mermaid
+flowchart TD
+    n1["1. Validate job and write<br/>round-robin splits"]
+    click n1 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-submit-split" "Open step, techniques, and source" _top
+    n2["2. Claim pending task under<br/>lease"]
+    click n2 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-claim-task" "Open step, techniques, and source" _top
+    n3["3. Fetch input and map to hash<br/>buckets"]
+    click n3 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-worker-map" "Open step, techniques, and source" _top
+    n4["4. Fetch shuffle, group and<br/>reduce"]
+    click n4 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-worker-reduce" "Open step, techniques, and source" _top
+    n5["5. Save local task output and<br/>report completion"]
+    click n5 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-write-output" "Open step, techniques, and source" _top
+    n6["6. Fence attempt and accept one<br/>receipt"]
+    click n6 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-accept-completion" "Open step, techniques, and source" _top
+    n7["7. Persist artifact before<br/>metadata and advance barriers"]
+    click n7 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-publish-advance" "Open step, techniques, and source" _top
+    n1 -->|"saved map tasks become pending"| n2
+    n2 -->|"phase is map"| n3
+    n2 -->|"phase is reduce"| n4
+    n3 -->|"bucketed output"| n5
+    n4 -->|"reduced pairs"| n5
+    n5 -->|"HTTP completion with task token"| n6
+    n6 -->|"valid current attempt"| n7
+    n7 -->|"next phase tasks pending"| n2
+```
+
+**Detailed workflows.** [MapReduce job lifecycle](#flow-workflow-mapreduce) · [Real-process verification and benchmark receipts](#flow-workflow-verification).
+
+<a id="flow-workflow-mapreduce"></a>
+
+<details>
+<summary>MapReduce job lifecycle</summary>
+
+The production HTTP path from submission through map and reduce barriers to durable result publication, including startup recovery and task retries.
+
+```mermaid
+flowchart TD
+    n9["9. Acquire exclusive owner and<br/>recover metadata"]
+    click n9 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-restart-recover" "Open step, techniques, and source" _top
+    n8["8. Authenticate and bound RPC"]
+    click n8 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-http-boundary" "Open step, techniques, and source" _top
+    n1["1. Validate job and write<br/>round-robin splits"]
+    click n1 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-submit-split" "Open step, techniques, and source" _top
+    n2["2. Claim pending task under<br/>lease"]
+    click n2 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-claim-task" "Open step, techniques, and source" _top
+    n3["3. Fetch input and map to hash<br/>buckets"]
+    click n3 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-worker-map" "Open step, techniques, and source" _top
+    n4["4. Fetch shuffle, group and<br/>reduce"]
+    click n4 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-worker-reduce" "Open step, techniques, and source" _top
+    n5["5. Save local task output and<br/>report completion"]
+    click n5 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-write-output" "Open step, techniques, and source" _top
+    n6["6. Fence attempt and accept one<br/>receipt"]
+    click n6 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-accept-completion" "Open step, techniques, and source" _top
+    n7["7. Persist artifact before<br/>metadata and advance barriers"]
+    click n7 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-publish-advance" "Open step, techniques, and source" _top
+    n1 -->|"saved map tasks become pending"| n2
+    n2 -->|"phase is map"| n3
+    n2 -->|"phase is reduce"| n4
+    n3 -->|"bucketed output"| n5
+    n4 -->|"reduced pairs"| n5
+    n5 -->|"completion with task token"| n6
+    n6 -->|"valid current attempt"| n7
+    n7 -->|"barrier admits next phase"| n2
+    n9 -->|"pending after restart"| n2
+    n8 -->|"authenticated request"| n1
+```
+
+</details>
+
+<a id="flow-workflow-verification"></a>
+
+<details>
+<summary>Real-process verification and benchmark receipts</summary>
+
+Separate maintained tools launch independent processes and compare results with local oracles; neither is a production runtime handoff.
+
+```mermaid
+flowchart TD
+    n10["10. Drive real workers against<br/>independent oracle"]
+    click n10 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-verification" "Open step, techniques, and source" _top
+    n11["11. Compare durable result and<br/>account shuffle bytes"]
+    click n11 href "https://github.com/STEVVVU/mapreduce-runtime#flow-step-benchmark-receipts" "Open step, techniques, and source" _top
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-submit-split"></a>
+
+##### 1. Validate job and write round-robin splits
+
+**Component.** POST /jobs. The coordinator validates module name, installed module, pairs and partition counts. It distributes record i to split i modulo split count, writes split files, then saves claimable map tasks.
+
+**Techniques at this step.** [Round-robin input splitting](#technique-round-robin-input-splitting) · [Allowlisted local module execution](#technique-allowlisted-local-module-execution) · [Atomic file publication ordering](#technique-atomic-file-publication-ordering).
+
+**Source.** [`src/coordinator.mjs:78`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L78) · [`src/coordinator.mjs:86`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L86). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-claim-task"></a>
+
+##### 2. Claim pending task under lease
+
+**Component.** claim and POST /claim. A worker polls; claim first expires overdue running tasks, then assigns a pending task with a new UUID, deadline and incremented attempt. Four attempts exhaust the task and fail its job.
+
+**Techniques at this step.** [Polling, leases, and bounded retry](#technique-polling-leases-bounded-retry).
+
+**Source.** [`src/worker.mjs:8`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/worker.mjs#L8) · [`src/coordinator.mjs:57`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L57). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-worker-map"></a>
+
+##### 3. Fetch input and map to hash buckets
+
+**Component.** worker map branch. The worker imports the locally installed allowlisted module, fetches and saves the assigned split, invokes map for each pair, and routes emitted pairs by SHA-256 key bucket.
+
+**Techniques at this step.** [Allowlisted local module execution](#technique-allowlisted-local-module-execution) · [Hash partitioning](#technique-hash-partitioning) · [Atomic file publication ordering](#technique-atomic-file-publication-ordering).
+
+**Source.** [`src/worker.mjs:14`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/worker.mjs#L14) · [`src/worker.mjs:16`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/worker.mjs#L16) · [`src/common.mjs:13`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/common.mjs#L13). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-worker-reduce"></a>
+
+##### 4. Fetch shuffle, group and reduce
+
+**Component.** worker reduce branch. After the map barrier, the worker fetches this reducer's bucket from each accepted map, saves each fetched partition, groups values by exact key, sorts groups with localeCompare and calls reduce.
+
+**Techniques at this step.** [Group, sort, and reduce](#technique-group-sort-reduce) · [Map and reduce phase barriers](#technique-map-reduce-phase-barriers) · [Atomic file publication ordering](#technique-atomic-file-publication-ordering).
+
+**Source.** [`src/worker.mjs:22`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/worker.mjs#L22) · [`src/coordinator.mjs:104`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L104). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-write-output"></a>
+
+##### 5. Save local task output and report completion
+
+**Component.** worker task completion. The worker atomically writes output.json then posts output with phase, index and token. A non-HTTP execution error is reported for retry; HTTP errors are logged and the worker resumes polling.
+
+**Techniques at this step.** [Atomic file publication ordering](#technique-atomic-file-publication-ordering) · [Polling, leases, and bounded retry](#technique-polling-leases-bounded-retry).
+
+**Source.** [`src/worker.mjs:31`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/worker.mjs#L31). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-accept-completion"></a>
+
+##### 6. Fence attempt and accept one receipt
+
+**Component.** POST /jobs/:id/complete. The coordinator accepts only the current unexpired running token for the current phase. A matching already-accepted token returns a duplicate receipt; stale tokens get 409. Map buckets and reduced key ownership are validated before publication.
+
+**Techniques at this step.** [Attempt fencing and accepted receipts](#technique-attempt-fencing-idempotent-receipts) · [Hash partitioning](#technique-hash-partitioning).
+
+**Source.** [`src/coordinator.mjs:109`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L109). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-publish-advance"></a>
+
+##### 7. Persist artifact before metadata and advance barriers
+
+**Component.** persist and advance. The accepted attempt artifact is atomically written first, then task state and publication event are updated. advance starts reducers only when all maps are done; it writes sorted combined results before marking the job done, then saves metadata.
+
+**Techniques at this step.** [Atomic file publication ordering](#technique-atomic-file-publication-ordering) · [Map and reduce phase barriers](#technique-map-reduce-phase-barriers).
+
+**Source.** [`src/coordinator.mjs:130`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L130) · [`src/coordinator.mjs:47`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L47). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-http-boundary"></a>
+
+##### 8. Authenticate and bound RPC
+
+**Component.** common HTTP helpers and coordinator server. Configuration requires a token of at least 16 characters; workers require a 127.0.0.1 hostname. RPC sends Bearer auth with a five-second abort timeout, while the coordinator checks auth, caps bodies at 4 MiB and sets request and header timeouts to ten seconds.
+
+**Techniques at this step.** [Authenticated, bounded loopback RPC](#technique-authenticated-bounded-loopback-rpc).
+
+**Source.** [`src/common.mjs:29`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/common.mjs#L29) · [`src/common.mjs:44`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/common.mjs#L44) · [`src/worker.mjs:4`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/worker.mjs#L4) · [`src/coordinator.mjs:72`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L72). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-restart-recover"></a>
+
+##### 9. Acquire exclusive owner and recover metadata
+
+**Component.** coordinator startup and metadata. A per-data-directory IPC endpoint excludes a second coordinator; owner.json detects a live PID and is removed only when that PID is gone. Startup merges durable job files over legacy state, resets running tasks to pending, and saves each job.
+
+**Techniques at this step.** [Exclusive IPC coordinator ownership](#technique-exclusive-ipc-coordinator-ownership) · [Per-job snapshot restart recovery](#technique-snapshot-restart-recovery) · [Atomic file publication ordering](#technique-atomic-file-publication-ordering).
+
+**Source.** [`src/coordinator.mjs:16`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L16) · [`src/metadata.mjs:11`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/metadata.mjs#L11) · [`src/coordinator.mjs:41`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/src/coordinator.mjs#L41). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-verification"></a>
+
+##### 10. Drive real workers against independent oracle
+
+**Component.** tools/verify.mjs. The verifier starts coordinator and separate workers, submits jobs, checks expected word counts and error/recovery cases, kills workers and coordinator, then asserts restart fencing and durable publication. Its finally block stops owned children and saves evidence.
+
+**Techniques at this step.** [Independent result oracles and owned process cleanup](#technique-independent-result-oracles-and-owned-process-cleanup).
+
+**Source.** [`tools/verify.mjs:50`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/tools/verify.mjs#L50) · [`tools/verify.mjs:19`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/tools/verify.mjs#L19). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-benchmark-receipts"></a>
+
+##### 11. Compare durable result and account shuffle bytes
+
+**Component.** tools/benchmark.mjs. The benchmark computes a deterministic word-count oracle, checks API and saved result equality, counts accepted map artifact bytes as shuffleBytes, records retries/publications, and cleans up owned processes. This is measurement tooling, not a production runtime stage.
+
+**Techniques at this step.** [Independent result oracles and owned process cleanup](#technique-independent-result-oracles-and-owned-process-cleanup).
+
+**Source.** [`tools/benchmark.mjs:19`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/tools/benchmark.mjs#L19) · [`tools/benchmark.mjs:157`](https://github.com/STEVVVU/mapreduce-runtime/blob/main/tools/benchmark.mjs#L157). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Coordinator submission through map and reduce publication; worker claim, execution, fencing and retries; authenticated loopback HTTP and restart ownership; independent real-process verification and benchmark receipts.
+
+- **Input partitioning and phase barriers.** Split creation and accepted map/reduce barriers are represented. [Step 1](#flow-step-submit-split), [Step 4](#flow-step-worker-reduce), [Step 7](#flow-step-publish-advance).
+- **Map routing and reduce grouping.** Worker hashing/grouping and coordinator bucket validation are represented. [Step 3](#flow-step-worker-map), [Step 4](#flow-step-worker-reduce), [Step 6](#flow-step-accept-completion).
+- **Trusted job execution.** Module name validation and local worker import are covered. [Step 1](#flow-step-submit-split), [Step 3](#flow-step-worker-map), [Step 4](#flow-step-worker-reduce).
+- **Task scheduling and accepted attempts.** Polling, expiration, attempt cap, stale fencing and duplicate receipt are covered. [Step 2](#flow-step-claim-task), [Step 5](#flow-step-write-output), [Step 6](#flow-step-accept-completion).
+- **Worker files and coordinator publication.** Worker artifacts precede completion; accepted artifact precedes metadata and final result. [Step 3](#flow-step-worker-map), [Step 4](#flow-step-worker-reduce), [Step 5](#flow-step-write-output), [Step 7](#flow-step-publish-advance).
+- **Coordinator ownership and recovery.** IPC ownership, metadata precedence and lease reset are covered. [Step 9](#flow-step-restart-recover).
+- **HTTP trust and resource bounds.** Token, loopback, body and timeout bounds are covered. [Step 8](#flow-step-http-boundary).
+- **Real-process verification and measurement receipts.** Independent oracles, owned process cleanup, result comparison and map artifact byte accounting are covered. [Step 10](#flow-step-verification), [Step 11](#flow-step-benchmark-receipts).
+
+Outside this flow audit:
+
+- `docs/benchmarks/2026-10-22-initial.md`. Historical measurement report, not active execution.
+- `.agents/skills/verify-rillmap/features/`. Feature prose; active driver is tools/verify.mjs.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -39,6 +293,8 @@ flowchart LR
 Rillmap is a small Node MapReduce runtime. It implements one coordinator, separate worker processes, named trusted map/reduce modules, durable task files, and recovery metadata. It is a single-host teaching runtime, not a cloud service or distributed database.
 
 A submitted job is split into [map tasks](#map-task). The coordinator waits at the [map barrier](#map-barrier), then schedules [reduce tasks](#reduce-task) over the key-hashed [shuffle](#shuffle) partitions. Leases bound task ownership; [durable publication](#durable-publication) follows accepted outputs.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>
