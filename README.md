@@ -2,6 +2,7 @@
 
 ## Guide
 
+- [Implementation techniques](#implementation-techniques)
 - [Architecture and execution guide](#architecture-and-execution-guide)
 - [Verification and evidence](#verification-and-evidence)
 - [Reproducible benchmark](#reproducible-benchmark)
@@ -243,5 +244,229 @@ A lease gives a worker a bounded interval for a task. Expiry allows retry and fe
 <details><summary>What is durable publication?</summary>
 
 It records task output before exposing the completed job. Verification compares API output with saved result files.
+
+</details>
+
+## Implementation techniques
+
+This section documents active Rillmap job execution, coordination, ownership and persistence. Rationale is inferred from current code.
+
+<a id="technique-leased-task-scheduling-recovery"></a>
+<a id="technique-single-coordinator-ownership"></a>
+<a id="technique-atomic-metadata-result-publication"></a>
+<a id="technique-map-grouping-reduction"></a>
+
+| Active subsystem | Technique cards | Source files |
+|---|---|---|
+| Input partitioning and phase barriers | [Round-robin input splitting](#technique-round-robin-input-splitting), [Map and reduce phase barriers](#technique-map-reduce-phase-barriers) | `src/coordinator.mjs`, `src/worker.mjs` |
+| Map routing and reduce grouping | [Hash partitioning](#technique-hash-partitioning), [Group, sort, and reduce](#technique-group-sort-reduce) | `src/common.mjs`, `src/worker.mjs`, `jobs/wordcount.mjs` |
+| Trusted job execution | [Allowlisted local module execution](#technique-allowlisted-local-module-execution) | `src/coordinator.mjs`, `src/worker.mjs` |
+| Task scheduling and accepted attempts | [Polling, leases, and bounded retry](#technique-polling-leases-bounded-retry), [Attempt fencing and accepted receipts](#technique-attempt-fencing-idempotent-receipts) | `src/coordinator.mjs`, `src/worker.mjs` |
+| Worker files and coordinator publication | [Atomic file publication ordering](#technique-atomic-file-publication-ordering) | `src/common.mjs`, `src/coordinator.mjs`, `src/worker.mjs` |
+| Coordinator ownership and recovery | [Exclusive IPC coordinator ownership](#technique-exclusive-ipc-coordinator-ownership), [Per-job snapshot restart recovery](#technique-snapshot-restart-recovery) | `src/coordinator.mjs`, `src/metadata.mjs` |
+| HTTP trust and resource bounds | [Authenticated, bounded loopback RPC](#technique-authenticated-bounded-loopback-rpc) | `src/common.mjs`, `src/coordinator.mjs`, `src/worker.mjs` |
+| Real-process verification and measurement receipts | [Independent result oracles and owned process cleanup](#technique-independent-result-oracles-and-owned-process-cleanup) | `tools/verify.mjs`, `tools/benchmark.mjs` |
+
+<a id="technique-round-robin-input-splitting"></a>
+
+<details>
+<summary>Round-robin input splitting</summary>
+
+**Mechanism.** The coordinator allocates the requested number of split arrays, then sends input record `i` to split `i % splits`. It writes every split before recording the job metadata that makes the map tasks claimable. Workers fetch their numbered input over HTTP and save a local attempt copy.
+
+**Example.** With three splits, records at positions 0, 3, and 6 go to split 0. These are illustrative positions, not benchmark data.
+
+**Why here.** Round-robin placement keeps the input layout independent of record keys and gives the scheduler fixed, numbered map tasks.
+
+**Tradeoffs.** Record count is spread across splits, but record sizes and map work can still be uneven. The runtime does not split one large record.
+
+**Code and ownership.** [`POST /jobs` split creation](src/coordinator.mjs#L86) and [worker input fetch](src/worker.mjs#L16), extension.
+
+</details>
+
+<a id="technique-map-reduce-phase-barriers"></a>
+
+<details>
+<summary>Map and reduce phase barriers</summary>
+
+**Mechanism.** `advance` changes a job from map to reduce only when every map task is done. The coordinator retains those accepted map task records as `job.maps`; shuffle reads require them to exist. It marks the job done only after every reducer is accepted and the combined result is written.
+
+**Example.** A reducer's `GET /shuffle/map/partition` request fails the barrier check while the job has no accepted map list.
+
+**Why here.** Reducers need all map partitions for their bucket, and the final output needs every reducer result.
+
+**Tradeoffs.** A slow map delays all reducers, and a slow reducer delays final publication. The runtime does not stream early reducer work.
+
+**Code and ownership.** [`advance`](src/coordinator.mjs#L47) and [shuffle route](src/coordinator.mjs#L104), extension.
+
+</details>
+
+<a id="technique-hash-partitioning"></a>
+
+<details>
+<summary>Hash partitioning</summary>
+
+**Mechanism.** `bucket` hashes each emitted string key with SHA-256, reads the first unsigned 32-bit word, and takes it modulo the reducer count. The worker appends each pair to that bucket. The coordinator checks the same rule before accepting a map attempt.
+
+**Example.** All map outputs for `word` use `bucket("word", reducers)` and reach the same reducer partition.
+
+**Why here.** Equal keys must meet at one reducer so it can combine their values.
+
+**Tradeoffs.** Modulo partitioning does not correct key skew. Changing the reducer count can move keys to different partitions.
+
+**Code and ownership.** [`bucket`](src/common.mjs#L13), [worker routing](src/worker.mjs#L19), and [coordinator validation](src/coordinator.mjs#L122), extension.
+
+</details>
+
+<a id="technique-group-sort-reduce"></a>
+
+<details>
+<summary>Group, sort, and reduce</summary>
+
+**Mechanism.** For one reducer, the worker reads that partition from every accepted map, stores each fetched bucket, and appends values to a `Map` keyed by exact string. It sorts the groups by `localeCompare`, calls the installed reduce function once per key, and writes the resulting pairs. The coordinator sorts the concatenated reducer outputs by key too.
+
+**Example.** Word count emits `[word, 1]`; the reducer sums each word's collected values. The example input is illustrative.
+
+**Why here.** Grouping supplies one value list per key, while sorting makes output order stable for inspection and result comparison.
+
+**Tradeoffs.** The reducer holds fetched pairs and groups in memory. Sorting defines locale order, which is not a bytewise or locale-independent collation contract.
+
+**Code and ownership.** [Worker grouping and reduce loop](src/worker.mjs#L22), [final result ordering](src/coordinator.mjs#L51), and [word-count functions](jobs/wordcount.mjs#L1), extension.
+
+</details>
+
+<a id="technique-allowlisted-local-module-execution"></a>
+
+<details>
+<summary>Allowlisted local module execution</summary>
+
+**Mechanism.** Submission accepts a module name matching a restricted pattern and verifies that `jobs/<name>.mjs` exists. The coordinator sends the name in the task; each worker imports that path from its own installed `jobs/` directory. The HTTP request carries data and a module name, never executable function text.
+
+**Example.** A request names `wordcount`; a worker imports `jobs/wordcount.mjs` and invokes its exported functions. It does not evaluate a submitted source string.
+
+**Why here.** This lets the runtime select among local coursework jobs without implementing code transfer or a remote-code sandbox.
+
+**Tradeoffs.** Coordinator and workers must have matching installed modules. These modules are trusted code with full worker-process privileges; the name check is not a sandbox.
+
+**Code and ownership.** [Submission validation](src/coordinator.mjs#L78) and [worker import](src/worker.mjs#L14), extension.
+
+</details>
+
+<a id="technique-polling-leases-bounded-retry"></a>
+
+<details>
+<summary>Polling, leases, and bounded retry</summary>
+
+**Mechanism.** Each worker repeatedly posts `/claim`, waits 100 ms after an empty response, and processes one task at a time. A claim sets a deadline and increments the attempt count before the coordinator responds. The next claim call expires overdue work and makes it pending. Four attempts exhaust the task and fail the job.
+
+**Example.** If a worker exits after claiming a map task, a later poll after the lease deadline can assign it again with a new token.
+
+**Why here.** Polling gives independent worker processes a simple way to find work; leases recover claims when a process disappears.
+
+**Tradeoffs.** There are no heartbeats or push notifications. Work longer than its lease may run twice, and retry does not stop old JavaScript or undo its external effects.
+
+**Code and ownership.** [Worker polling loop](src/worker.mjs#L8) and [claim and expiry logic](src/coordinator.mjs#L57), extension.
+
+</details>
+
+<a id="technique-attempt-fencing-idempotent-receipts"></a>
+
+<details>
+<summary>Attempt fencing and accepted receipts</summary>
+
+**Mechanism.** A claim creates a UUID token. Completion is accepted only for the current phase and task when status is running, the token matches, and the lease has not expired. The coordinator writes output under that token before setting `accepted` and `done`. A replay using the accepted token returns a duplicate receipt without writing again; an old token gets HTTP 409.
+
+**Example.** When task attempt B replaces expired attempt A, A's late output cannot replace B's accepted artifact.
+
+**Why here.** Retries can overlap a slow attempt, so task identity alone cannot identify the publisher that currently owns the task.
+
+**Tradeoffs.** This fences coordinator publication, not side effects inside job functions. Deterministic, side-effect-free modules remain necessary for retry-safe results.
+
+**Code and ownership.** [Completion validation, duplicate receipt, and acceptance](src/coordinator.mjs#L109), extension.
+
+</details>
+
+<a id="technique-atomic-file-publication-ordering"></a>
+
+<details>
+<summary>Atomic file publication ordering</summary>
+
+**Mechanism.** `atomic` serializes JSON, creates a unique temporary file exclusively, writes and flushes it, closes it, then renames it to the destination. Workers use this for fetched inputs, shuffle buckets, and output under a token directory. The coordinator persists accepted attempt output before changing task state; it writes the final result before marking the job done, then saves the job snapshot.
+
+**Example.** A crash before the accepted-attempt write leaves no task marked done. A crash after the attempt file but before metadata save can leave an orphan file, which recovery does not treat as accepted.
+
+**Why here.** Readers need complete JSON artifacts, and coordinator metadata must not point at output that was never published.
+
+**Tradeoffs.** Files are flushed before rename, but the code does not flush parent directories or replicate storage. Power-loss and disk-loss durability are not established.
+
+**Code and ownership.** [`atomic`](src/common.mjs#L20), [worker artifact writes](src/worker.mjs#L17), and [coordinator acceptance and final result](src/coordinator.mjs#L130), extension.
+
+</details>
+
+<a id="technique-exclusive-ipc-coordinator-ownership"></a>
+
+<details>
+<summary>Exclusive IPC coordinator ownership</summary>
+
+**Mechanism.** The coordinator resolves the data directory to a canonical path, hashes its identity, and listens on a process-owned IPC endpoint before inspecting or reclaiming the diagnostic PID file. Windows uses a named pipe; Linux uses an abstract Unix socket. A competing process cannot bind the same endpoint while the owner lives.
+
+**Example.** Two startup contenders for one canonical data directory cannot both pass the IPC listen step.
+
+**Why here.** File snapshots have one writer; concurrent coordinators could otherwise race metadata and artifact publication.
+
+**Tradeoffs.** The guard arbitrates local processes on supported platforms. It does not elect a leader across hosts or replicate coordinator state.
+
+**Code and ownership.** [Canonical identity and `ownerGuard`](src/coordinator.mjs#L16), extension using Node's IPC support.
+
+</details>
+
+<a id="technique-snapshot-restart-recovery"></a>
+
+<details>
+<summary>Per-job snapshot restart recovery</summary>
+
+**Mechanism.** Startup imports legacy `state.json`, then overlays each validated `jobs/<UUID>.json` snapshot so newer job state wins. The coordinator resets persisted running tasks to pending and saves those snapshots before listening. Attempt files remain keyed by token, and only a task's accepted token identifies its published artifact.
+
+**Example.** After a coordinator restart, a previously running task can be claimed again; its pre-restart token fails completion fencing.
+
+**Why here.** Per-job snapshots restore active work without rewriting one full registry for every job update, while the legacy file remains an import source.
+
+**Tradeoffs.** Corrupt snapshots or ID mismatches refuse startup. Older releases cannot use these authoritative per-job snapshots as their registry.
+
+**Code and ownership.** [`readMetadata`](src/metadata.mjs#L11) and [startup lease reset](src/coordinator.mjs#L41), extension.
+
+</details>
+
+<a id="technique-authenticated-bounded-loopback-rpc"></a>
+
+<details>
+<summary>Authenticated, bounded loopback RPC</summary>
+
+**Mechanism.** Every coordinator request must carry the configured bearer token. The coordinator listens on `127.0.0.1`, and workers reject URLs whose hostname is not exactly that address. Request bodies are capped at 4 MiB, JSON numbers must be finite, pair lists and key lengths have limits, and HTTP request/header timeouts are 10 seconds. Worker RPC calls abort after 5 seconds.
+
+**Example.** An unauthenticated health request returns 401; an oversized request body is rejected before JSON parsing.
+
+**Why here.** These checks bound the local HTTP protocol and keep module selection and task data behind one shared credential.
+
+**Tradeoffs.** The token gives trusted participants access to all jobs. There is no TLS, tenant isolation, or remote-host support.
+
+**Code and ownership.** [Authorization and server timeouts](src/coordinator.mjs#L72), [`body` and `rpc`](src/common.mjs#L29), and [worker loopback check](src/worker.mjs#L4), extension.
+
+</details>
+
+<a id="technique-independent-result-oracles-and-owned-process-cleanup"></a>
+
+<details>
+<summary>Independent result oracles, byte accounting, and owned process cleanup</summary>
+
+**Mechanism.** The verification and benchmark drivers compute sequential expected results from the original records and compare them with HTTP output and durable result files. The benchmark hashes input and expected output, then sums accepted map artifact file sizes as logical shuffle bytes; this excludes HTTP framing and retries. Both drivers track launched children, stop and wait for them in `finally`, and retain evidence after cleanup.
+
+**Example.** `countOracle` independently tokenizes input text and counts words before comparing results. A benchmark sample marks its oracle true only after both result comparisons pass and records the accepted map artifact byte total. A byte count is not an end-to-end network traffic measurement.
+
+**Why here.** An independent computation can catch partitioning and reduction errors that a worker-produced answer cannot expose by itself.
+
+**Tradeoffs.** Correctness checks cover selected inputs and recovery cases. Logical shuffle bytes exclude protocol overhead and retry traffic, and cleanup can report child-stop errors instead of producing a passing result.
+
+**Code and ownership.** [`countOracle` and `compare`](tools/verify.mjs#L50), [benchmark oracle and byte accounting](tools/benchmark.mjs#L19), and [owned child cleanup](tools/benchmark.mjs#L157), extension.
 
 </details>
